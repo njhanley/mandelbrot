@@ -1,7 +1,8 @@
 #include <stdlib.h>
 #include <unistd.h>
+#include <GL/glew.h>
 #include "SDL.h"
-#include "palette.h"
+#include "shaders.h"
 
 #define ITERATIONS 1024
 #define PERIODICITY 20
@@ -18,47 +19,45 @@ double max(double a, double b)
 	return a > b ? a : b;
 }
 
-void draw_mandelbrot(SDL_Renderer *renderer, int bw, int width, int height, int iterations, int periodicity,
-		     double pos_x, double pos_y, double zoom)
+GLuint load_shader(GLenum type, const char *source)
 {
-	const double center_x = width / 2.0, center_y = height / 2.0;
-	for (int screen_y = 0; screen_y < height; screen_y++) {
-		for (int screen_x = 0; screen_x < width; screen_x++) {
-			const double cx = pos_x + (screen_x - center_x) * zoom;
-			const double cy = pos_y + (screen_y - center_y) * zoom;
+	GLuint shader = glCreateShader(type);
+	char *sources[2] = {"#version 150\n", source};
+	glShaderSource(shader, 2, sources, NULL);
+	glCompileShader(shader);
 
-			int i = 0, j = 0;
-			double x = 0.0, y = 0.0, old_x = 0.0, old_y = 0.0;
-			while (i < iterations && x * x + y * y <= 4) {
-				double tmp_x = x * x - y * y + cx;
-				double tmp_y = 2.0 * x * y + cy;
-				x = tmp_x, y = tmp_y;
-				i++;
+	GLint compiled = 0;
+	glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+	if (compiled == GL_FALSE) {
+		GLint len = 0;
+		glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &len);
 
-				if (x == old_x && y == old_y) {
-					i = iterations;
-					break;
-				}
+		char *msg = malloc(len);
+		glGetShaderInfoLog(shader, len, &len, msg);
+		SDL_Log("load_shader: %s\n", msg);
+		free(msg);
+		
+		glDeleteShader(shader);
 
-				if (j++ >= periodicity)
-					old_x = x, old_y = y, j = 0;
-			}
-
-			SDL_Color color = i < iterations
-					? bw ? white : palette[i * palette_len / iterations]
-					: black;
-			SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
-			SDL_RenderDrawPoint(renderer, screen_x, screen_y);
-		}
+		return 0;
 	}
 
-	SDL_RenderPresent(renderer);
+	return shader;
+}
+
+void draw_mandelbrot(SDL_Window *window, GLuint program, int iterations, float pos_x, float pos_y, float zoom)
+{
+	glUniform1i(glGetUniformLocation(program, "iterations"), iterations);
+	glUniform4f(glGetUniformLocation(program, "position"), pos_x, pos_y, 0.0, 0.0);
+	glUniform1f(glGetUniformLocation(program, "zoom"), zoom);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	SDL_GL_SwapWindow(window);
 }
 
 int main(int argc, char *argv[])
 {
 	int bw = 0, verbose = 0, iterations = ITERATIONS, periodicity = PERIODICITY, width = WIDTH, height = HEIGHT;
-	double pos_x = INITIAL_X, pos_y = INITIAL_Y, zoom = max(SCALE_WIDTH / width, SCALE_HEIGHT / height);
+	float pos_x = INITIAL_X, pos_y = INITIAL_Y, zoom = max(SCALE_WIDTH / width, SCALE_HEIGHT / height);
 
 	int c;
 	while ((c = getopt(argc, argv, "bvi:p:w:h:x:y:z:")) != -1) {
@@ -82,17 +81,79 @@ int main(int argc, char *argv[])
 	}
 	atexit(SDL_Quit);
 
+	if (SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3) ||
+	    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2) ||
+	    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE)) {
+		SDL_Log("SDL_SetAttribute: %s\n", SDL_GetError());
+		return 1;
+	}
+
 	SDL_Window *window = SDL_CreateWindow("mandelbrot", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-					      width, height, SDL_WINDOW_RESIZABLE);
+					      width, height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
 	if (!window) {
 		SDL_Log("SDL_CreateWindow: %s\n", SDL_GetError());
 		return 1;
 	}
-	SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-	if (!renderer) {
-		SDL_Log("SDL_CreateRenderer: %s\n", SDL_GetError());
+	SDL_GLContext context = SDL_GL_CreateContext(window);
+	if (!context) {
+		SDL_Log("SDL_GL_CreateContext: %s\n", SDL_GetError());
 		return 1;
 	}
+
+	GLenum err = glewInit();
+	if (err != GLEW_OK) {
+		SDL_Log("glewInit: %s\n", glewGetErrorString(err));
+		return 1;
+	}
+
+	if (SDL_GL_SetSwapInterval(1)) {
+		SDL_Log("SDL_GL_SetSwapInterval: %s\n", SDL_GetError());
+		return 1;
+	}
+
+	GLuint vertex_shader = load_shader(GL_VERTEX_SHADER, vertex_shader_source);
+	GLuint fragment_shader = load_shader(GL_FRAGMENT_SHADER, fragment_shader_source);
+	if (!vertex_shader || !fragment_shader) {
+		return 1;
+	}
+
+	GLuint program = glCreateProgram();
+
+	glAttachShader(program, vertex_shader);
+	glAttachShader(program, fragment_shader);
+
+	glLinkProgram(program);
+	glUseProgram(program);
+
+	glDetachShader(program, vertex_shader);
+	glDetachShader(program, fragment_shader);
+	glDeleteShader(vertex_shader);
+	glDeleteShader(fragment_shader);
+
+	const GLfloat rectangle[4][2] = {
+		{-1.0, -1.0},
+		{ 1.0, -1.0},
+		{-1.0,  1.0},
+		{ 1.0,  1.0},
+	};
+
+	GLuint vbo;
+	glGenBuffers(1, &vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(rectangle), rectangle, GL_STATIC_DRAW);
+
+	GLuint vao;
+	glGenVertexArrays(1, &vao);
+	glBindVertexArray(vao);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+	glEnableVertexAttribArray(0);
+
+	glUniform1i(glGetUniformLocation(program, "bw"), bw);
+	glUniform4f(glGetUniformLocation(program, "center"), width / 2.0, height / 2.0, 0.0, 0.0);
+	glUniform4f(glGetUniformLocation(program, "position"), pos_x, pos_y, 0.0, 0.0);
+	glUniform1f(glGetUniformLocation(program, "zoom"), zoom);
+	glUniform1i(glGetUniformLocation(program, "iterations"), iterations);
+	glUniform1i(glGetUniformLocation(program, "periodicity"), periodicity);
 
 	SDL_DisplayMode mode;
 	if (SDL_GetWindowDisplayMode(window, &mode)) {
@@ -116,6 +177,8 @@ int main(int argc, char *argv[])
 				case SDL_WINDOWEVENT_RESIZED:
 					width = event.window.data1;
 					height = event.window.data2;
+					glViewport(0, 0, width, height);
+					glUniform4f(glGetUniformLocation(program, "center"), width / 2.0, height / 2.0, 0.0, 0.0);
 					break;
 				}
 				break;
@@ -130,11 +193,11 @@ int main(int argc, char *argv[])
 					redraw = 1;
 					break;
 				case SDLK_w: case SDLK_UP:
-					pos_y -= height / 8.0 * zoom;
+					pos_y += height / 8.0 * zoom;
 					redraw = 1;
 					break;
 				case SDLK_s: case SDLK_DOWN:
-					pos_y += height / 8.0 * zoom;
+					pos_y -= height / 8.0 * zoom;
 					redraw = 1;
 					break;
 				case SDLK_z:
@@ -152,6 +215,7 @@ int main(int argc, char *argv[])
 					break;
 				case SDLK_b:
 					bw = !bw;
+					glUniform1i(glGetUniformLocation(program, "bw"), bw);
 					redraw = 1;
 					break;
 				case SDLK_COMMA:
@@ -168,7 +232,7 @@ int main(int argc, char *argv[])
 			case SDL_MOUSEBUTTONDOWN:
 				if (event.button.button == SDL_BUTTON_LEFT) {
 					pos_x += (event.button.x - width  / 2.0) * zoom;
-					pos_y += (event.button.y - height / 2.0) * zoom;
+					pos_y -= (event.button.y - height / 2.0) * zoom;
 					redraw = 1;
 				}
 				break;
@@ -184,10 +248,10 @@ int main(int argc, char *argv[])
 
 		if (redraw) {
 			if (verbose)
-				SDL_Log("draw_mandelbrot\npos_x = %.20g\npos_y = %.20g\nzoom = %.20g\n", pos_x, pos_y,
+				SDL_Log("draw_mandelbrot:\npos_x = %.20g\npos_y = %.20g\nzoom = %.20g\n", pos_x, pos_y,
 					zoom);
 			Uint64 start = SDL_GetPerformanceCounter();
-			draw_mandelbrot(renderer, bw, width, height, iterations, periodicity, pos_x, pos_y, zoom);
+			draw_mandelbrot(window, program, iterations, pos_x, pos_y, zoom);
 			Uint64 now = SDL_GetPerformanceCounter();
 			if (verbose)
 				SDL_Log("took %f seconds\n", (double) (now - start) /SDL_GetPerformanceFrequency());
@@ -198,7 +262,9 @@ int main(int argc, char *argv[])
 	}
 
 exit:
-	SDL_DestroyRenderer(renderer);
+	glDeleteProgram(program);
+
+	SDL_GL_DeleteContext(context);
 	SDL_DestroyWindow(window);
 
 	return 0;
